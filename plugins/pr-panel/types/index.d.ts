@@ -34,6 +34,7 @@ declare module 'claude-code' {
       page: number
       file: number
       isConfirming: boolean
+      isCopied: boolean
     }
   }
 }

@@ -11,6 +11,7 @@ const tab = atom({ plugin: 'pr-panel', key: 'tab' } as const, 'summary')
 const page = atom({ plugin: 'pr-panel', key: 'page' } as const, 0)
 const file = atom({ plugin: 'pr-panel', key: 'file' } as const, 0)
 const isConfirming = atom({ plugin: 'pr-panel', key: 'isConfirming' } as const, false)
+const isCopied = atom({ plugin: 'pr-panel', key: 'isCopied' } as const, false)
 
 const TABS: { id: Tab; label: string; hotkey: string }[] = [
   { id: 'summary', label: 'Resumo', hotkey: '1' },
@@ -54,6 +55,18 @@ const ghPipeline = (jobs: Job[]) => {
   if (jobs.some(j => ['in_progress', 'queued', 'pending', 'expected', 'waiting'].includes(j.status))) return 'running'
   return 'success'
 }
+
+const tone = (status: string) =>
+  /success|pass|merged|clean/.test(status) ? 'success'
+  : /fail|error|cancel|timed|dirty|conflict|blocked/.test(status) ? 'error'
+  : /skip|neutral|manual|none|unknown/.test(status) ? 'inactive'
+  : 'warning'
+
+const badge = (p: Pr) =>
+  p.state === 'merged' ? { label: 'MERGED', color: 'merged' }
+  : p.state === 'closed' ? { label: 'CLOSED', color: 'error' }
+  : p.isDraft ? { label: 'DRAFT', color: 'inactive' }
+  : { label: 'OPEN', color: 'success' }
 
 const glyph = (status: string) =>
   /success|pass|merged/.test(status) ? '✔'
@@ -236,11 +249,17 @@ export const register: Register = on => {
       switch (current) {
         case 'summary':
           return (
-            <Box flexDirection="column">
-              <Text>{data.source} → {data.target} · @{data.author} · {data.state}{data.isDraft ? ' (draft)' : ''}</Text>
-              <Text>{glyph(data.pipeline)} pipeline {data.pipeline} · merge: {data.mergeStatus || '?'}{data.isAutoMerge ? ' · auto-merge on' : ''}</Text>
-              <Text dimColor>{data.files.length} arquivos · +{data.files.reduce((s, f) => s + f.add, 0)} −{data.files.reduce((s, f) => s + f.del, 0)} · {data.comments.length} comentários</Text>
-              <Markdown key="body" text={data.body.split('\n').slice(0, rows).join('\n') || '_Sem descrição._'} />
+            <Box flexDirection="column" gap={1}>
+              <Box flexDirection="column">
+                <Text><Text color="subtle">branch   </Text>{data.source} <Text color="subtle">→</Text> {data.target}</Text>
+                <Text><Text color="subtle">autor    </Text>@{data.author} <Text color="subtle">· atualizado há {ago(data.updatedAt)}</Text></Text>
+                <Text><Text color="subtle">pipeline </Text><Text color={tone(data.pipeline)}>{glyph(data.pipeline)} {data.pipeline}</Text></Text>
+                <Text><Text color="subtle">merge    </Text><Text color={tone(data.mergeStatus)}>{data.mergeStatus || '?'}</Text>{data.isAutoMerge ? <Text color="success"> · auto-merge ligado</Text> : ''}</Text>
+                <Text><Text color="subtle">mudanças </Text>{data.files.length} arquivos <Text color="diffAdded">+{data.files.reduce((s, f) => s + f.add, 0)}</Text> <Text color="diffRemoved">−{data.files.reduce((s, f) => s + f.del, 0)}</Text> <Text color="subtle">· {data.comments.length} comentários</Text></Text>
+              </Box>
+              <Box flexDirection="column" borderStyle="round" borderColor="subtle" paddingX={1}>
+                <Markdown key="body" text={data.body.split('\n').slice(0, rows).join('\n') || '_Sem descrição._'} />
+              </Box>
             </Box>
           )
         case 'comments':
@@ -286,18 +305,29 @@ export const register: Register = on => {
     const confirming = await read($, isConfirming)
     const isOpen = data.state === 'open' || data.state === 'opened'
 
+    const copied = await read($, isCopied)
+    const b = badge(data)
+
     return (
-      <Box flexDirection="column" width={width}>
-        <Text bold wrap="truncate-end">{data.provider === 'github' ? '#' : '!'}{data.number} {data.title}</Text>
-        <Box flexWrap="wrap">
-          {TABS.map(t => (
-            <Button key={`tab-${t.id}`} label={t.label} hotkey={t.hotkey} variant={t.id === current ? 'primary' : undefined}
-              onPress={async () => { await update($, tab, () => t.id); await update($, page, () => 0) }} />
-          ))}
+      <Box flexDirection="column" width={width} gap={1}>
+        <Box flexDirection="column">
+          <Box>
+            <Text backgroundColor={b.color} color="inverseText" bold> {b.label} </Text>
+            <Text color="subtle"> {data.provider === 'github' ? 'GitHub #' : 'GitLab !'}{data.number}</Text>
+            {loading && <Text color="subtle"> · atualizando…</Text>}
+          </Box>
+          <Text bold wrap="truncate-end">{data.title}</Text>
         </Box>
-        <Box flexWrap="wrap">
-          <Button key="copy" label="Copiar link" hotkey="c" onPress={press => $.ui.copy({ text: data.url, surface: press.surface })} />
-          <Button key="refresh" label={loading ? 'Atualizando…' : 'Atualizar'} hotkey="r" onPress={() => refresh($)} />
+        <Box flexWrap="wrap" columnGap={1}>
+          <Button key="copy" label={copied ? '✔ Copiado' : 'Copiar link'} hotkey="c" variant={copied ? 'primary' : undefined}
+            onPress={async press => {
+              const res = await $.ui.copy({ text: data.url, surface: press.surface })
+              if (!res.isCopied) { $.ui.toast(`Não copiou: ${res.reason}`); return }
+              $.ui.toast(`Link copiado: ${data.url}`)
+              await update($, isCopied, () => true)
+              $.clock.after(2000, () => void update($, isCopied, () => false))
+            }} />
+          <Button key="refresh" label="Atualizar" hotkey="r" onPress={() => refresh($)} />
           {isOpen && (
             <Button key="auto" label={data.isAutoMerge ? 'Cancelar auto-merge' : 'Auto-merge'} hotkey="a"
               onPress={() => act($, 'Auto-merge', autoArgv)} />
@@ -306,7 +336,18 @@ export const register: Register = on => {
           {isOpen && confirming && <Button key="confirm" label="Confirmar merge" variant="primary" hotkey="y" onPress={() => act($, 'Merge', mergeArgv)} />}
           {isOpen && confirming && <Button key="cancel" label="Cancelar" hotkey="n" onPress={() => update($, isConfirming, () => false)} />}
         </Box>
-        {err && <Text color="red" wrap="truncate-end">{err}</Text>}
+        <Box flexDirection="column">
+          <Box flexWrap="wrap">
+            {TABS.map(t => (
+              <Button key={`tab-${t.id}`} plain hotkey={t.hotkey} variant={t.id === current ? 'primary' : undefined}
+                onPress={async () => { await update($, tab, () => t.id); await update($, page, () => 0) }}>
+                <Text bold={t.id === current} underline={t.id === current} color={t.id === current ? 'suggestion' : 'subtle'}>{t.label}</Text>{'  '}
+              </Button>
+            ))}
+          </Box>
+          <Text color="subtle">{'─'.repeat(Math.max(1, width))}</Text>
+        </Box>
+        {err && <Text color="error" wrap="truncate-end">{err}</Text>}
         {current === 'code' ? await codeTab() : body()}
       </Box>
     )
