@@ -1,0 +1,8 @@
+{
+  "name": "tiagokriok-plugins",
+  "owner": { "name": "Tiago Carioca" },
+  "plugins": [
+    { "name": "quote", "source": "./plugins/quote", "description": "Quote selected transcript text, with optional comments, into your next prompt" },
+    { "name": "pr-panel", "source": "./plugins/pr-panel", "description": "Side pane with the current branch's GitHub PR or GitLab MR: description, comments, pipeline, diff, activity, merge and auto-merge" }
+  ]
+}
