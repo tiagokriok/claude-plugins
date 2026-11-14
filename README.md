@@ -32,3 +32,5 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 ## License
 
 MIT
+
+<!-- pr-panel smoke test -->
