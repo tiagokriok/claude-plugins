@@ -1,1 +1,1 @@
-{ "name": "quote", "version": "0.1.0", "license": "MIT", "author": { "name": "Tiago Carioca" }, "description": "Quote selected transcript text into the prompt via /quote or a band", "types": "./types/index.d.ts" }
+{ "name": "quote", "version": "0.2.0", "license": "MIT", "author": { "name": "Tiago Carioca" }, "description": "Quote selected transcript text into the prompt via /quote or a band", "types": "./types/index.d.ts" }

@@ -4,6 +4,7 @@ export type Entry = { author: string; text: string; at: string }
 export type FileDiff = { path: string; add: number; del: number; lines: string[] }
 export type Pr = {
   provider: Provider
+  headSha: string
   number: number
   title: string
   url: string

@@ -1,4 +1,4 @@
-export type Quote = { text: string; comment: string }
+export type Quote = { id: number; text: string }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -6,7 +6,7 @@ declare module 'claude-code' {
       pending: string | null
       dismissed: string | null
       quotes: Shaped<Quote[]>
-      editing: number | null
+      nextId: number
     }
   }
 }
