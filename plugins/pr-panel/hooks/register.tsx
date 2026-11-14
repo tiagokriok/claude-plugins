@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Entry, FileDiff, Job, Pr, Provider, Tab } from '../types'
+import type { Entry, FileDiff, Job, ListItem, Pr, Provider, Tab } from '../types'
 
 const PANE = 'pr-panel'
 const pr = atom({ plugin: 'pr-panel', key: 'pr' } as const, null, { shape: 'pr-1' })
@@ -12,6 +12,11 @@ const page = atom({ plugin: 'pr-panel', key: 'page' } as const, 0)
 const file = atom({ plugin: 'pr-panel', key: 'file' } as const, 0)
 const isConfirming = atom({ plugin: 'pr-panel', key: 'isConfirming' } as const, false)
 const isCopied = atom({ plugin: 'pr-panel', key: 'isCopied' } as const, false)
+const repo = atom({ plugin: 'pr-panel', key: 'repo' } as const, null)
+const view = atom({ plugin: 'pr-panel', key: 'view' } as const, 'detail')
+const selected = atom({ plugin: 'pr-panel', key: 'selected' } as const, null)
+const prList = atom({ plugin: 'pr-panel', key: 'prList' } as const, [], { shape: 'list-1' })
+const listPage = atom({ plugin: 'pr-panel', key: 'listPage' } as const, 0)
 
 const TABS: { id: Tab; label: string; hotkey: string }[] = [
   { id: 'summary', label: 'Summary', hotkey: '1' },
@@ -86,9 +91,17 @@ const ago = (iso: string) => {
 }
 
 const run = async ($: EngineInterface, argv: string[]) => {
-  const out = await $.process.run(argv, { timeoutMs: 60_000 })
+  const cwd = (await read($, repo)) ?? undefined
+  const out = await $.process.run(argv, { timeoutMs: 60_000, ...(cwd ? { cwd } : {}) })
   if (out.exitCode !== 0) throw new Error((out.stderr || out.stdout).trim().split('\n').slice(-3).join(' '))
   return out.stdout as string
+}
+
+const locate = async ($: EngineInterface) => {
+  if (await read($, repo)) return
+  const out = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { timeoutMs: 10_000 })
+  if (out.exitCode === 0) await update($, repo, () => out.stdout.trim())
+  else throw new Error('Not in a git repository. Run /pr-panel inside a repo.')
 }
 
 const detect = async ($: EngineInterface): Promise<Provider> => {
@@ -96,11 +109,12 @@ const detect = async ($: EngineInterface): Promise<Provider> => {
   return /github/i.test(url) ? 'github' : 'gitlab'
 }
 
-const fetchGithub = async ($: EngineInterface): Promise<Pr> => {
+const fetchGithub = async ($: EngineInterface, n?: number | null): Promise<Pr> => {
+  const target = n ? [String(n)] : []
   const fields = 'number,title,url,state,isDraft,author,headRefName,baseRefName,body,comments,reviews,commits,statusCheckRollup,autoMergeRequest,mergeStateStatus,updatedAt,headRefOid'
   const [json, diff] = await Promise.all([
-    run($, ['gh', 'pr', 'view', '--json', fields]),
-    run($, ['gh', 'pr', 'diff']).catch(() => ''),
+    run($, ['gh', 'pr', 'view', ...target, '--json', fields]),
+    run($, ['gh', 'pr', 'diff', ...target]).catch(() => ''),
   ])
   const d: Any = JSON.parse(json)
   const jobs = (d.statusCheckRollup ?? []).map(ghCheck)
@@ -111,7 +125,7 @@ const fetchGithub = async ($: EngineInterface): Promise<Pr> => {
   const activity: Entry[] = [
     ...(d.commits ?? []).map((c: Any) => ({ author: c.authors?.[0]?.login || c.authors?.[0]?.name || '?', text: `commit ${c.messageHeadline}`, at: c.committedDate ?? '' })),
     ...(d.reviews ?? []).map((r: Any) => ({ author: r.author?.login ?? '?', text: `review ${String(r.state).toLowerCase()}`, at: r.submittedAt ?? '' })),
-    ...(d.comments ?? []).map((c: Any) => ({ author: c.author?.login ?? '?', text: 'comentou', at: c.createdAt ?? '' })),
+    ...(d.comments ?? []).map((c: Any) => ({ author: c.author?.login ?? '?', text: 'commented', at: c.createdAt ?? '' })),
   ].sort(byDate)
   return {
     provider: 'github', headSha: d.headRefOid ?? '', number: d.number, title: d.title, url: d.url, state: String(d.state).toLowerCase(),
@@ -121,8 +135,8 @@ const fetchGithub = async ($: EngineInterface): Promise<Pr> => {
   }
 }
 
-const fetchGitlab = async ($: EngineInterface): Promise<Pr> => {
-  const d: Any = JSON.parse(await run($, ['glab', 'mr', 'view', '-F', 'json']))
+const fetchGitlab = async ($: EngineInterface, n?: number | null): Promise<Pr> => {
+  const d: Any = JSON.parse(await run($, ['glab', 'mr', 'view', ...(n ? [String(n)] : []), '-F', 'json']))
   const iid = d.iid
   const pipelineId = d.head_pipeline?.id ?? d.pipeline?.id
   const [notesRaw, jobsRaw, diff] = await Promise.all([
@@ -144,11 +158,73 @@ const fetchGitlab = async ($: EngineInterface): Promise<Pr> => {
   }
 }
 
+const fetchDetail = async ($: EngineInterface, provider: Provider) => {
+  const n = await read($, selected)
+  return provider === 'github' ? fetchGithub($, n) : fetchGitlab($, n)
+}
+
+const ghReview = (decision: string) =>
+  decision === 'CHANGES_REQUESTED' ? 'changes_requested' : decision === 'REVIEW_REQUIRED' ? 'review_required' : ''
+
+const fetchList = async ($: EngineInterface, provider: Provider): Promise<ListItem[]> => {
+  if (provider === 'github') {
+    const fields = 'number,title,author,isDraft,headRefName,reviewDecision,statusCheckRollup,mergeStateStatus,updatedAt'
+    const rows: Any[] = JSON.parse(await run($, ['gh', 'pr', 'list', '--limit', '100', '--json', fields]))
+    return rows.map(d => {
+      const jobs = (d.statusCheckRollup ?? []).map(ghCheck)
+      return listItem({
+        provider, number: d.number, title: d.title, author: d.author?.login ?? '?', isDraft: !!d.isDraft,
+        source: d.headRefName, updatedAt: d.updatedAt ?? '', jobs, pipeline: ghPipeline(jobs),
+        mergeStatus: ghReview(d.reviewDecision) || String(d.mergeStateStatus ?? '').toLowerCase(),
+      })
+    })
+  }
+  const rows: Any[] = JSON.parse(await run($, ['glab', 'mr', 'list', '--per-page', '100', '-F', 'json']))
+  return rows.map(d => {
+    const m = String(d.detailed_merge_status ?? d.merge_status ?? '')
+    return listItem({
+      provider, number: d.iid, title: d.title, author: d.author?.username ?? '?', isDraft: !!d.draft,
+      source: d.source_branch, updatedAt: d.updated_at ?? '', jobs: [],
+      pipeline: d.head_pipeline?.status ?? (m === 'ci_still_running' ? 'running' : m === 'ci_must_pass' ? 'failed' : 'none'),
+      mergeStatus: m,
+    })
+  })
+}
+
+type ListSource = Pick<Pr, 'provider' | 'number' | 'title' | 'author' | 'isDraft' | 'source' | 'updatedAt' | 'jobs' | 'pipeline' | 'mergeStatus'>
+
+export const listItem = (d: ListSource): ListItem => {
+  const v = verdict({ ...d, headSha: '', url: '', state: 'open', target: '', body: '', isAutoMerge: false, comments: [], activity: [], files: [] })
+  return { number: d.number, title: d.title, author: d.author, isDraft: d.isDraft, source: d.source, updatedAt: d.updatedAt, verdict: v.text, color: v.color }
+}
+
+export const groupOf = (item: ListItem) =>
+  item.isDraft ? 'Drafts' : item.color === 'success' ? 'Ready to merge' : item.color === 'warning' ? 'In progress' : 'Blocked'
+
+const GROUPS = ['Ready to merge', 'In progress', 'Blocked', 'Drafts']
+
+const isNoPr = (message: string) => /no (open )?pull requests? found|no merge requests? (available|found)|not found/i.test(message)
+
 const refresh = async ($: EngineInterface) => {
   await update($, isLoading, () => true)
   try {
-    const data = (await detect($)) === 'github' ? await fetchGithub($) : await fetchGitlab($)
-    await update($, pr, () => data)
+    await locate($)
+    const provider = await detect($)
+    if ((await read($, view)) === 'list') {
+      const items = await fetchList($, provider)
+      await update($, prList, () => items)
+    } else {
+      try {
+        const data = await fetchDetail($, provider)
+        await update($, pr, () => data)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if ((await read($, selected)) !== null || !isNoPr(message)) throw err
+        await update($, view, () => 'list')
+        const items = await fetchList($, provider)
+        await update($, prList, () => items)
+      }
+    }
     await update($, error, () => null)
   } catch (err) {
     await update($, error, () => (err instanceof Error ? err.message : String(err)))
@@ -157,11 +233,25 @@ const refresh = async ($: EngineInterface) => {
   }
 }
 
+const openPr = async ($: EngineInterface, n: number | null) => {
+  await update($, selected, () => n)
+  await update($, view, () => 'detail')
+  await update($, pr, () => null)
+  await update($, tab, () => 'summary')
+  await update($, page, () => 0)
+  await refresh($)
+}
+
+const showList = async ($: EngineInterface) => {
+  await update($, view, () => 'list')
+  await refresh($)
+}
+
 const act = async ($: EngineInterface, label: string, argv: (p: Pr) => string[]) => {
   const seen = await read($, pr)
   if (!seen) return
   try {
-    const fresh = seen.provider === 'github' ? await fetchGithub($) : await fetchGitlab($)
+    const fresh = seen.provider === 'github' ? await fetchGithub($, seen.number) : await fetchGitlab($, seen.number)
     if (fresh.number !== seen.number || fresh.headSha !== seen.headSha) {
       await update($, pr, () => fresh)
       $.ui.toast(`${label} cancelled: the branch changed since you looked. Review it and try again.`)
@@ -203,7 +293,9 @@ export const verdict = (p: Pr): Verdict => {
   if (p.isDraft || /draft/.test(m)) blockers.push('draft')
   if (/dirty|conflict/.test(m)) blockers.push('conflicts')
   if (failed > 0 || p.pipeline === 'failed') blockers.push(failed > 1 ? `${failed} checks failed` : 'check failed')
-  if (/not_approved|approvals|review/.test(m)) blockers.push('needs approval')
+  if (/changes_requested/.test(m)) blockers.push('changes requested')
+  else if (/not_approved|approvals|review/.test(m)) blockers.push('needs approval')
+  if (/ci_must_pass/.test(m) && failed === 0 && p.pipeline !== 'failed' && !running) blockers.push('pipeline must pass')
   if (/discussions/.test(m)) blockers.push('unresolved threads')
   if (/blocked/.test(m) && blockers.length === 0) blockers.push('blocked by rules')
   if (blockers.length > 0) return { text: blockers.join(' · '), color: 'error' }
@@ -215,16 +307,19 @@ export const verdict = (p: Pr): Verdict => {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'pr-panel', description: 'Show this branch PR/MR in a side pane' })
+    await $.command.register({ name: 'pr-panel', description: 'Show this branch PR/MR in a side pane; /pr-panel list for all open ones', argumentHint: '[list|<number>]' })
     $.clock.every(60_000, async () => {
-      if (await read($, pr)) void refresh($)
+      if ((await read($, pr)) || (await read($, prList)).length > 0) void refresh($)
     })
     return next(e)
   })
 
-  on('command.run', { command: 'pr-panel' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'Pull request' })
-    void refresh($)
+  on('command.run', { command: 'pr-panel' }, async ($, e) => {
+    await $.ui.open({ id: PANE, title: 'Pull requests' })
+    const arg = e.args.trim()
+    await update($, repo, () => null)
+    if (/^(list|ls|all)$/i.test(arg)) void showList($)
+    else void openPr($, /^\d+$/.test(arg) ? Number(arg) : null)
     return { text: 'PR pane opened.' }
   })
 
@@ -238,11 +333,62 @@ export const register: Register = on => {
     const width = e.props.bodyColumns
     const rows = Math.max(8, (e.viewport?.rows ?? 30) - 8)
 
+    const mode = await read($, view)
+    if (mode === 'list') {
+      const items = await read($, prList)
+      const size = Math.max(3, Math.floor(rows / 2) - 2)
+      const lastPage = Math.max(0, Math.ceil(items.length / size) - 1)
+      const at = Math.min(await read($, listPage), lastPage)
+      const ordered = GROUPS.flatMap(g => items.filter(i => groupOf(i) === g))
+      const shown = ordered.slice(at * size, at * size + size)
+      const counts = GROUPS.map(g => [g, items.filter(i => groupOf(i) === g).length] as const).filter(([, c]) => c > 0)
+      return (
+        <Box flexDirection="column" width={width} gap={1}>
+          <Box flexDirection="column">
+            <Text bold>Open pull requests <Text color="subtle">· {items.length}{loading ? ' · refreshing…' : ''}</Text></Text>
+            <Text color="subtle" wrap="truncate-end">{counts.map(([g, c]) => `${c} ${g.toLowerCase()}`).join(' · ') || ' '}</Text>
+          </Box>
+          <Box columnGap={1}>
+            <Button key="refresh" label="Refresh" hotkey="r" onPress={() => refresh($)} />
+            <Button key="branch" label="This branch" hotkey="b" onPress={() => openPr($, null)} />
+          </Box>
+          {err && <Text color="error" wrap="truncate-end">{err}</Text>}
+          {items.length === 0 && !loading && <Text color="subtle">No open pull requests.</Text>}
+          <Box flexDirection="column">
+            {shown.map((item, i) => {
+              const group = groupOf(item)
+              const prev = i === 0 ? (at > 0 ? groupOf(ordered[at * size - 1]!) : null) : groupOf(shown[i - 1]!)
+              return (
+                <Box key={`row-${item.number}`} flexDirection="column">
+                  {group !== prev && <Text bold color="subtle">{group}</Text>}
+                  <Button key={`pr-${item.number}`} plain onPress={() => openPr($, item.number)}>
+                    <Text color={item.color}>● </Text>
+                    <Text dimColor={item.isDraft} bold={!item.isDraft}>{item.title}</Text>
+                  </Button>
+                  <Text color="subtle" wrap="truncate-end">   #{item.number} · @{item.author} · {item.source} · {ago(item.updatedAt)} · <Text color={item.color}>{item.verdict}</Text></Text>
+                </Box>
+              )
+            })}
+          </Box>
+          {lastPage > 0 && (
+            <Box>
+              <Button key="lprev" label="◀" plain onPress={() => update($, listPage, n => Math.max(0, n - 1))} />
+              <Text color="subtle"> {at + 1}/{lastPage + 1} </Text>
+              <Button key="lnext" label="▶" plain onPress={() => update($, listPage, n => Math.min(lastPage, n + 1))} />
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
     if (!data) {
       return (
         <Box flexDirection="column">
           <Text dimColor>{loading ? 'Loading…' : err ? `Error: ${err}` : 'No PR/MR for this branch.'}</Text>
-          <Button key="refresh" label="Refresh" onPress={() => refresh($)} />
+          <Box columnGap={1}>
+            <Button key="refresh" label="Refresh" onPress={() => refresh($)} />
+            <Button key="list" label="All open" hotkey="l" onPress={() => showList($)} />
+          </Box>
         </Box>
       )
     }
@@ -364,6 +510,7 @@ export const register: Register = on => {
               $.clock.after(2000, () => void update($, isCopied, () => false))
             }} />
           <Button key="refresh" label="Refresh" hotkey="r" onPress={() => refresh($)} />
+          <Button key="list" label="◀ All open" hotkey="l" onPress={() => showList($)} />
           {isOpen && (isRunning || data.isAutoMerge) && (
             <Button key="auto" label={data.isAutoMerge ? 'Cancel auto-merge' : 'Auto-merge'} hotkey="a"
               onPress={() => act($, 'Auto-merge', autoArgv)} />

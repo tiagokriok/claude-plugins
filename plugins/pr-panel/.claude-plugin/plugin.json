@@ -1,1 +1,1 @@
-{ "name": "pr-panel", "version": "0.2.0", "license": "MIT", "author": { "name": "Tiago Carioca" }, "description": "Side pane with the current branch's GitHub PR or GitLab MR", "types": "./types/index.d.ts" }
+{ "name": "pr-panel", "version": "0.3.0", "license": "MIT", "author": { "name": "Tiago Carioca" }, "description": "Side pane with the current branch's GitHub PR or GitLab MR", "types": "./types/index.d.ts" }
