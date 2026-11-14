@@ -52,3 +52,15 @@ test('verdict is green only when everything is clean', async () => {
   expect(verdict({ ...base, provider: 'gitlab', mergeStatus: 'not_approved' }).text).toBe('needs approval')
   expect(verdict({ ...base, state: 'merged' }).color).toBe('merged')
 })
+
+import { groupOf, listItem } from '../hooks/register'
+
+test('list items are grouped by what is left to do', async () => {
+  const row = { provider: 'github' as const, number: 1, title: 't', author: 'a', isDraft: false, source: 's', updatedAt: '', jobs: [], pipeline: 'success', mergeStatus: 'clean' }
+  expect(groupOf(listItem(row))).toBe('Ready to merge')
+  expect(groupOf(listItem({ ...row, pipeline: 'running' }))).toBe('In progress')
+  expect(groupOf(listItem({ ...row, mergeStatus: 'changes_requested' }))).toBe('Blocked')
+  expect(listItem({ ...row, mergeStatus: 'changes_requested' }).verdict).toBe('changes requested')
+  expect(groupOf(listItem({ ...row, isDraft: true }))).toBe('Drafts')
+  expect(groupOf(listItem({ ...row, provider: 'gitlab', mergeStatus: 'ci_must_pass', pipeline: 'none' }))).toBe('Blocked')
+})

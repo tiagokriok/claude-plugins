@@ -23,6 +23,16 @@ export type Pr = {
   files: FileDiff[]
   updatedAt: string
 }
+export type ListItem = {
+  number: number
+  title: string
+  author: string
+  isDraft: boolean
+  source: string
+  updatedAt: string
+  verdict: string
+  color: string
+}
 export type Tab = 'summary' | 'comments' | 'pipeline' | 'code' | 'activity'
 
 declare module 'claude-code' {
@@ -36,6 +46,11 @@ declare module 'claude-code' {
       file: number
       isConfirming: boolean
       isCopied: boolean
+      repo: string | null
+      view: 'list' | 'detail'
+      selected: number | null
+      prList: Shaped<ListItem[]>
+      listPage: number
     }
   }
 }
