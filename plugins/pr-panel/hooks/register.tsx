@@ -56,6 +56,9 @@ const ghPipeline = (jobs: Job[]) => {
   return 'success'
 }
 
+export const isPipelineRunning = (status: string) =>
+  /running|pending|created|preparing|scheduled|waiting|queued|in_progress/.test(status)
+
 const tone = (status: string) =>
   /success|pass|merged|clean/.test(status) ? 'success'
   : /fail|error|cancel|timed|dirty|conflict|blocked/.test(status) ? 'error'
@@ -306,6 +309,7 @@ export const register: Register = on => {
     const isOpen = data.state === 'open' || data.state === 'opened'
 
     const copied = await read($, isCopied)
+    const isRunning = isPipelineRunning(data.pipeline)
     const b = badge(data)
 
     return (
@@ -328,11 +332,11 @@ export const register: Register = on => {
               $.clock.after(2000, () => void update($, isCopied, () => false))
             }} />
           <Button key="refresh" label="Atualizar" hotkey="r" onPress={() => refresh($)} />
-          {isOpen && (
+          {isOpen && (isRunning || data.isAutoMerge) && (
             <Button key="auto" label={data.isAutoMerge ? 'Cancelar auto-merge' : 'Auto-merge'} hotkey="a"
               onPress={() => act($, 'Auto-merge', autoArgv)} />
           )}
-          {isOpen && !confirming && <Button key="merge" label="Merge" hotkey="m" onPress={() => update($, isConfirming, () => true)} />}
+          {isOpen && !isRunning && !data.isAutoMerge && !confirming && <Button key="merge" label="Merge" hotkey="m" onPress={() => update($, isConfirming, () => true)} />}
           {isOpen && confirming && <Button key="confirm" label="Confirmar merge" variant="primary" hotkey="y" onPress={() => act($, 'Merge', mergeArgv)} />}
           {isOpen && confirming && <Button key="cancel" label="Cancelar" hotkey="n" onPress={() => update($, isConfirming, () => false)} />}
         </Box>
