@@ -14,11 +14,11 @@ const isConfirming = atom({ plugin: 'pr-panel', key: 'isConfirming' } as const, 
 const isCopied = atom({ plugin: 'pr-panel', key: 'isCopied' } as const, false)
 
 const TABS: { id: Tab; label: string; hotkey: string }[] = [
-  { id: 'summary', label: 'Resumo', hotkey: '1' },
-  { id: 'comments', label: 'Comentários', hotkey: '2' },
+  { id: 'summary', label: 'Summary', hotkey: '1' },
+  { id: 'comments', label: 'Comments', hotkey: '2' },
   { id: 'pipeline', label: 'Pipeline', hotkey: '3' },
-  { id: 'code', label: 'Código', hotkey: '4' },
-  { id: 'activity', label: 'Atividade', hotkey: '5' },
+  { id: 'code', label: 'Code', hotkey: '4' },
+  { id: 'activity', label: 'Activity', hotkey: '5' },
 ]
 
 type Any = Record<string, any>
@@ -97,7 +97,7 @@ const detect = async ($: EngineInterface): Promise<Provider> => {
 }
 
 const fetchGithub = async ($: EngineInterface): Promise<Pr> => {
-  const fields = 'number,title,url,state,isDraft,author,headRefName,baseRefName,body,comments,reviews,commits,statusCheckRollup,autoMergeRequest,mergeStateStatus,updatedAt'
+  const fields = 'number,title,url,state,isDraft,author,headRefName,baseRefName,body,comments,reviews,commits,statusCheckRollup,autoMergeRequest,mergeStateStatus,updatedAt,headRefOid'
   const [json, diff] = await Promise.all([
     run($, ['gh', 'pr', 'view', '--json', fields]),
     run($, ['gh', 'pr', 'diff']).catch(() => ''),
@@ -114,7 +114,7 @@ const fetchGithub = async ($: EngineInterface): Promise<Pr> => {
     ...(d.comments ?? []).map((c: Any) => ({ author: c.author?.login ?? '?', text: 'comentou', at: c.createdAt ?? '' })),
   ].sort(byDate)
   return {
-    provider: 'github', number: d.number, title: d.title, url: d.url, state: String(d.state).toLowerCase(),
+    provider: 'github', headSha: d.headRefOid ?? '', number: d.number, title: d.title, url: d.url, state: String(d.state).toLowerCase(),
     isDraft: !!d.isDraft, author: d.author?.login ?? '?', source: d.headRefName, target: d.baseRefName,
     body: d.body ?? '', mergeStatus: String(d.mergeStateStatus ?? '').toLowerCase(), isAutoMerge: !!d.autoMergeRequest,
     pipeline: ghPipeline(jobs), jobs, comments, activity, files: parseDiff(diff), updatedAt: d.updatedAt ?? '',
@@ -134,7 +134,7 @@ const fetchGitlab = async ($: EngineInterface): Promise<Pr> => {
   const jobs: Job[] = JSON.parse(jobsRaw).map((j: Any) => ({ name: `${j.stage}: ${j.name}`, status: j.allow_failure && j.status === 'failed' ? 'failed (allowed)' : j.status }))
   const toEntry = (n: Any): Entry => ({ author: n.author?.username ?? '?', text: n.body ?? '', at: n.created_at ?? '' })
   return {
-    provider: 'gitlab', number: iid, title: d.title, url: d.web_url, state: d.state, isDraft: !!d.draft,
+    provider: 'gitlab', headSha: d.sha ?? '', number: iid, title: d.title, url: d.web_url, state: d.state, isDraft: !!d.draft,
     author: d.author?.username ?? '?', source: d.source_branch, target: d.target_branch, body: d.description ?? '',
     mergeStatus: d.detailed_merge_status ?? d.merge_status ?? '', isAutoMerge: !!(d.merge_when_pipeline_succeeds || d.auto_merge_enabled),
     pipeline: d.head_pipeline?.status ?? d.pipeline?.status ?? 'none', jobs,
@@ -158,30 +158,60 @@ const refresh = async ($: EngineInterface) => {
 }
 
 const act = async ($: EngineInterface, label: string, argv: (p: Pr) => string[]) => {
-  const current = await read($, pr)
-  if (!current) return
+  const seen = await read($, pr)
+  if (!seen) return
   try {
-    await run($, argv(current))
-    $.ui.toast(`${label}: ok`)
+    const fresh = seen.provider === 'github' ? await fetchGithub($) : await fetchGitlab($)
+    if (fresh.number !== seen.number || fresh.headSha !== seen.headSha) {
+      await update($, pr, () => fresh)
+      $.ui.toast(`${label} cancelled: the branch changed since you looked. Review it and try again.`)
+      return
+    }
+    await run($, argv(fresh))
+    $.ui.toast(`${label}: done`)
   } catch (err) {
-    $.ui.toast(`${label} falhou: ${err instanceof Error ? err.message : err}`)
+    $.ui.toast(`${label} failed: ${err instanceof Error ? err.message : err}`)
+  } finally {
+    await update($, isConfirming, () => false)
+    await refresh($)
   }
-  await update($, isConfirming, () => false)
-  await refresh($)
 }
 
-const mergeArgv = (p: Pr) =>
+export const mergeArgv = (p: Pr) =>
   p.provider === 'github'
-    ? ['gh', 'pr', 'merge', String(p.number), '--squash']
-    : ['glab', 'mr', 'merge', String(p.number), '--yes', '--auto-merge=false']
+    ? ['gh', 'pr', 'merge', String(p.number), '--squash', '--match-head-commit', p.headSha]
+    : ['glab', 'mr', 'merge', String(p.number), '--yes', '--auto-merge=false', '--sha', p.headSha]
 
-const autoArgv = (p: Pr) =>
+export const autoArgv = (p: Pr) =>
   p.provider === 'github'
-    ? ['gh', 'pr', 'merge', String(p.number), p.isAutoMerge ? '--disable-auto' : '--auto', ...(p.isAutoMerge ? [] : ['--squash'])]
+    ? p.isAutoMerge
+      ? ['gh', 'pr', 'merge', String(p.number), '--disable-auto']
+      : ['gh', 'pr', 'merge', String(p.number), '--auto', '--squash', '--match-head-commit', p.headSha]
     : p.isAutoMerge
       ? ['glab', 'api', '-X', 'POST', `projects/:id/merge_requests/${p.number}/cancel_merge_when_pipeline_succeeds`]
-      : ['glab', 'mr', 'merge', String(p.number), '--yes', '--auto-merge']
+      : ['glab', 'mr', 'merge', String(p.number), '--yes', '--auto-merge', '--sha', p.headSha]
 
+type Verdict = { text: string; color: string }
+
+export const verdict = (p: Pr): Verdict => {
+  if (p.state === 'merged') return { text: 'merged', color: 'merged' }
+  if (p.state === 'closed') return { text: 'closed', color: 'error' }
+  const failed = p.jobs.filter(j => /^(fail|error|cancel|timed)/.test(j.status)).length
+  const running = isPipelineRunning(p.pipeline)
+  const m = p.mergeStatus
+  const blockers: string[] = []
+  if (p.isDraft || /draft/.test(m)) blockers.push('draft')
+  if (/dirty|conflict/.test(m)) blockers.push('conflicts')
+  if (failed > 0 || p.pipeline === 'failed') blockers.push(failed > 1 ? `${failed} checks failed` : 'check failed')
+  if (/not_approved|approvals|review/.test(m)) blockers.push('needs approval')
+  if (/discussions/.test(m)) blockers.push('unresolved threads')
+  if (/blocked/.test(m) && blockers.length === 0) blockers.push('blocked by rules')
+  if (blockers.length > 0) return { text: blockers.join(' · '), color: 'error' }
+  if (running) return { text: `checks running${p.isAutoMerge ? ' · auto-merge on' : ''}`, color: 'warning' }
+  if (/behind|need_rebase/.test(m)) return { text: 'behind base', color: 'warning' }
+  if (/unknown|checking|unchecked/.test(m) || m === '') return { text: 'checking…', color: 'warning' }
+  return { text: 'ready to merge', color: 'success' }
+}
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -211,8 +241,8 @@ export const register: Register = on => {
     if (!data) {
       return (
         <Box flexDirection="column">
-          <Text dimColor>{loading ? 'Carregando…' : err ? `Erro: ${err}` : 'Nenhum PR/MR para esta branch.'}</Text>
-          <Button key="refresh" label="Atualizar" onPress={() => refresh($)} />
+          <Text dimColor>{loading ? 'Loading…' : err ? `Error: ${err}` : 'No PR/MR for this branch.'}</Text>
+          <Button key="refresh" label="Refresh" onPress={() => refresh($)} />
         </Box>
       )
     }
@@ -233,7 +263,7 @@ export const register: Register = on => {
     }
 
     const entries = (list: Entry[], size: number, max: number) => {
-      if (list.length === 0) return <Text dimColor>Nada ainda.</Text>
+      if (list.length === 0) return <Text dimColor>Nothing yet.</Text>
       const p = pager(list.length, size)
       return (
         <Box flexDirection="column">
@@ -255,13 +285,13 @@ export const register: Register = on => {
             <Box flexDirection="column" gap={1}>
               <Box flexDirection="column">
                 <Text><Text color="subtle">branch   </Text>{data.source} <Text color="subtle">→</Text> {data.target}</Text>
-                <Text><Text color="subtle">autor    </Text>@{data.author} <Text color="subtle">· atualizado há {ago(data.updatedAt)}</Text></Text>
+                <Text><Text color="subtle">author   </Text>@{data.author} <Text color="subtle">· updated {ago(data.updatedAt)} ago</Text></Text>
                 <Text><Text color="subtle">pipeline </Text><Text color={tone(data.pipeline)}>{glyph(data.pipeline)} {data.pipeline}</Text></Text>
-                <Text><Text color="subtle">merge    </Text><Text color={tone(data.mergeStatus)}>{data.mergeStatus || '?'}</Text>{data.isAutoMerge ? <Text color="success"> · auto-merge ligado</Text> : ''}</Text>
-                <Text><Text color="subtle">mudanças </Text>{data.files.length} arquivos <Text color="diffAdded">+{data.files.reduce((s, f) => s + f.add, 0)}</Text> <Text color="diffRemoved">−{data.files.reduce((s, f) => s + f.del, 0)}</Text> <Text color="subtle">· {data.comments.length} comentários</Text></Text>
+                <Text><Text color="subtle">merge    </Text><Text color="subtle">{data.mergeStatus || '?'}</Text>{data.isAutoMerge ? <Text color="success"> · auto-merge on</Text> : ''}</Text>
+                <Text><Text color="subtle">changes  </Text>{data.files.length} files <Text color="diffAdded">+{data.files.reduce((s, f) => s + f.add, 0)}</Text> <Text color="diffRemoved">−{data.files.reduce((s, f) => s + f.del, 0)}</Text> <Text color="subtle">· {data.comments.length} comments</Text></Text>
               </Box>
               <Box flexDirection="column" borderStyle="round" borderColor="subtle" paddingX={1}>
-                <Markdown key="body" text={data.body.split('\n').slice(0, rows).join('\n') || '_Sem descrição._'} />
+                <Markdown key="body" text={data.body.split('\n').slice(0, rows).join('\n') || '_No description._'} />
               </Box>
             </Box>
           )
@@ -288,14 +318,14 @@ export const register: Register = on => {
     const codeTab = async () => {
       const idx = Math.min(await read($, file), Math.max(0, data.files.length - 1))
       const f = data.files[idx]
-      if (!f) return <Text dimColor>Sem diff.</Text>
+      if (!f) return <Text dimColor>No diff.</Text>
       const p = pager(f.lines.length, rows - 2)
       return (
         <Box flexDirection="column">
           <Box>
-            <Button key="fprev" label="◀ arq" plain onPress={async () => { await update($, file, n => Math.max(0, n - 1)); await update($, page, () => 0) }} />
+            <Button key="fprev" label="◀ file" plain onPress={async () => { await update($, file, n => Math.max(0, n - 1)); await update($, page, () => 0) }} />
             <Text bold wrap="truncate-end"> {idx + 1}/{data.files.length} {f.path} <Text color="green">+{f.add}</Text> <Text color="red">−{f.del}</Text> </Text>
-            <Button key="fnext" label="arq ▶" plain onPress={async () => { await update($, file, n => Math.min(data.files.length - 1, n + 1)); await update($, page, () => 0) }} />
+            <Button key="fnext" label="file ▶" plain onPress={async () => { await update($, file, n => Math.min(data.files.length - 1, n + 1)); await update($, page, () => 0) }} />
           </Box>
           {f.lines.slice(p.at * (rows - 2), p.at * (rows - 2) + rows - 2).map((l, i) => (
             <Text key={`l${i}`} wrap="truncate-end" color={l.startsWith('+') ? 'green' : l.startsWith('-') ? 'red' : undefined} dimColor={l.startsWith('@@')}>{l || ' '}</Text>
@@ -311,6 +341,7 @@ export const register: Register = on => {
     const copied = await read($, isCopied)
     const isRunning = isPipelineRunning(data.pipeline)
     const b = badge(data)
+    const v = verdict(data)
 
     return (
       <Box flexDirection="column" width={width} gap={1}>
@@ -318,27 +349,28 @@ export const register: Register = on => {
           <Box>
             <Text backgroundColor={b.color} color="inverseText" bold> {b.label} </Text>
             <Text color="subtle"> {data.provider === 'github' ? 'GitHub #' : 'GitLab !'}{data.number}</Text>
-            {loading && <Text color="subtle"> · atualizando…</Text>}
+            {loading && <Text color="subtle"> · refreshing…</Text>}
           </Box>
           <Text bold wrap="truncate-end">{data.title}</Text>
+          <Text color={v.color} bold>● {v.text}</Text>
         </Box>
         <Box flexWrap="wrap" columnGap={1}>
-          <Button key="copy" label={copied ? '✔ Copiado' : 'Copiar link'} hotkey="c" variant={copied ? 'primary' : undefined}
+          <Button key="copy" label={copied ? '✔ Copied' : 'Copy link'} hotkey="c" variant={copied ? 'primary' : undefined}
             onPress={async press => {
               const res = await $.ui.copy({ text: data.url, surface: press.surface })
-              if (!res.isCopied) { $.ui.toast(`Não copiou: ${res.reason}`); return }
-              $.ui.toast(`Link copiado: ${data.url}`)
+              if (!res.isCopied) { $.ui.toast(`Not copied: ${res.reason}`); return }
+              $.ui.toast(`Link copied: ${data.url}`)
               await update($, isCopied, () => true)
               $.clock.after(2000, () => void update($, isCopied, () => false))
             }} />
-          <Button key="refresh" label="Atualizar" hotkey="r" onPress={() => refresh($)} />
+          <Button key="refresh" label="Refresh" hotkey="r" onPress={() => refresh($)} />
           {isOpen && (isRunning || data.isAutoMerge) && (
-            <Button key="auto" label={data.isAutoMerge ? 'Cancelar auto-merge' : 'Auto-merge'} hotkey="a"
+            <Button key="auto" label={data.isAutoMerge ? 'Cancel auto-merge' : 'Auto-merge'} hotkey="a"
               onPress={() => act($, 'Auto-merge', autoArgv)} />
           )}
           {isOpen && !isRunning && !data.isAutoMerge && !confirming && <Button key="merge" label="Merge" hotkey="m" onPress={() => update($, isConfirming, () => true)} />}
-          {isOpen && confirming && <Button key="confirm" label="Confirmar merge" variant="primary" hotkey="y" onPress={() => act($, 'Merge', mergeArgv)} />}
-          {isOpen && confirming && <Button key="cancel" label="Cancelar" hotkey="n" onPress={() => update($, isConfirming, () => false)} />}
+          {isOpen && confirming && <Button key="confirm" label="Confirm merge" variant="primary" hotkey="y" onPress={() => act($, 'Merge', mergeArgv)} />}
+          {isOpen && confirming && <Button key="cancel" label="Cancel" hotkey="n" onPress={() => update($, isConfirming, () => false)} />}
         </Box>
         <Box flexDirection="column">
           <Box flexWrap="wrap">
